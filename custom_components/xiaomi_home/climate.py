@@ -54,8 +54,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.const import UnitOfTemperature
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.climate import (
-    FAN_ON, FAN_OFF, SWING_OFF, SWING_BOTH, SWING_VERTICAL, SWING_HORIZONTAL,
-    ATTR_TEMPERATURE, HVACMode, HVACAction, ClimateEntity, ClimateEntityFeature)
+    FAN_AUTO, FAN_HIGH, FAN_LOW, FAN_MEDIUM, FAN_ON, FAN_OFF, SWING_OFF,
+    SWING_BOTH, SWING_VERTICAL, SWING_HORIZONTAL, ATTR_TEMPERATURE, HVACMode,
+    HVACAction, ClimateEntity, ClimateEntityFeature)
 
 from .miot.const import DOMAIN
 from .miot.miot_device import MIoTDevice, MIoTServiceEntity, MIoTEntityData
@@ -226,7 +227,7 @@ class FeatureFanMode(MIoTServiceEntity, ClimateEntity):
 
     def __init__(self, miot_device: MIoTDevice,
                  entity_data: MIoTEntityData) -> None:
-        """Initialize the feature class."""
+        """初始化风速属性，并将指定空调伴侣的风速映射为 HA 标准模式。"""
         self._prop_fan_on = None
         self._prop_fan_level = None
         self._fan_mode_map = None
@@ -243,7 +244,18 @@ class FeatureFanMode(MIoTServiceEntity, ClimateEntity):
                                   self.entity_id)
                     continue
                 self._fan_mode_map = prop.value_list.to_map()
-                self._attr_fan_modes = prop.value_list.descriptions
+                if miot_device.model == 'lumi.acpartner.mcn02':
+                    built_in_modes = {
+                        'auto': FAN_AUTO,
+                        'low': FAN_LOW,
+                        'medium': FAN_MEDIUM,
+                        'high': FAN_HIGH,
+                    }
+                    for item in prop.value_list.items:
+                        if item.name in built_in_modes:
+                            self._fan_mode_map[item.value] = (
+                                built_in_modes[item.name])
+                self._attr_fan_modes = list(self._fan_mode_map.values())
                 self._attr_supported_features |= ClimateEntityFeature.FAN_MODE
                 self._prop_fan_level = prop
             elif prop.name == 'on' and prop.service.name == 'fan-control':
@@ -366,11 +378,14 @@ class FeatureSwingMode(MIoTServiceEntity, ClimateEntity):
 class FeatureTemperature(MIoTServiceEntity, ClimateEntity):
     """Temperature of the climate entity."""
     _prop_env_temperature: Optional[MIoTSpecProperty]
+    _target_temperature_fallback: bool
 
     def __init__(self, miot_device: MIoTDevice,
                  entity_data: MIoTEntityData) -> None:
-        """Initialize the feature class."""
+        """初始化环境温度属性，并为指定空调伴侣启用目标温度回退。"""
         self._prop_env_temperature = None
+        self._target_temperature_fallback = (
+            miot_device.model == 'lumi.acpartner.mcn02')
 
         super().__init__(miot_device=miot_device, entity_data=entity_data)
         # properties
@@ -381,9 +396,12 @@ class FeatureTemperature(MIoTServiceEntity, ClimateEntity):
 
     @property
     def current_temperature(self) -> Optional[float]:
-        """The current environment temperature."""
-        return (self.get_prop_value(prop=self._prop_env_temperature)
-                if self._prop_env_temperature else None)
+        """返回环境温度；指定空调伴侣缺少环境温度属性时返回目标温度。"""
+        if self._prop_env_temperature:
+            return self.get_prop_value(prop=self._prop_env_temperature)
+        if self._target_temperature_fallback:
+            return self.target_temperature
+        return None
 
 
 class FeatureHumidity(MIoTServiceEntity, ClimateEntity):

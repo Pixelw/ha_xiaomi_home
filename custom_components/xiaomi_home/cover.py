@@ -91,6 +91,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry,
 class Cover(MIoTServiceEntity, CoverEntity):
     """Cover entities for Xiaomi Home."""
     # pylint: disable=unused-argument
+    # 电机停止状态与终点位置的云端上报可能乱序，保留运动状态的最长时间。
+    _STATUS_STOP_GRACE_SECONDS: float = 1.0
+    # 这些型号在到位后仍会持续上报 opening 或 closing 状态。
+    _TERMINAL_STATUS_STUCK_MODELS = {'bjkcz.curtain.5max'}
     _cover_dead_zone_width: int
     _prop_motor_control: Optional[MIoTSpecProperty]
     _prop_motor_value_open: Optional[int]
@@ -107,10 +111,16 @@ class Cover(MIoTServiceEntity, CoverEntity):
     _prop_position_value_range: Optional[int]
     _prop_pos_closing: bool
     _prop_pos_opening: bool
+    _status_was_moving: bool
+    _status_stop_pending: bool
+    _terminal_status_motion_direction: Optional[str]
+    _terminal_status_motion_start_position: Optional[int]
+    _terminal_status_motion_target_position: Optional[int]
+    _terminal_status_motion_has_left_start: bool
 
     def __init__(self, miot_device: MIoTDevice,
                  entity_data: MIoTEntityData) -> None:
-        """Initialize the Cover."""
+        """初始化窗帘控制属性，并订阅位置与电机状态以处理乱序和到位上报。"""
         super().__init__(miot_device=miot_device, entity_data=entity_data)
         self._attr_device_class = entity_data.spec.device_class
         self._attr_supported_color_modes = set()
@@ -134,6 +144,12 @@ class Cover(MIoTServiceEntity, CoverEntity):
         self._prop_position_value_range = None
         self._prop_pos_closing = False
         self._prop_pos_opening = False
+        self._status_was_moving = False
+        self._status_stop_pending = False
+        self._terminal_status_motion_direction = None
+        self._terminal_status_motion_start_position = None
+        self._terminal_status_motion_target_position = None
+        self._terminal_status_motion_has_left_start = False
 
         # properties
         for prop in entity_data.props:
@@ -203,51 +219,143 @@ class Cover(MIoTServiceEntity, CoverEntity):
                                                    prop.value_range.min_)
                 self._attr_supported_features |= CoverEntityFeature.SET_POSITION
                 self._prop_target_position = prop
-        # For the device that has the current position property but no status
-        # property, the current position property will be used to determine the
-        # opening and the closing status.
-        if (self._prop_status is None) and (self._prop_current_position
-                                            is not None):
+        # 当电机先上报停止、后上报终点位置时，避免短暂被 HA 判定为 open。
+        if self._prop_status is not None:
+            self.sub_prop_changed(self._prop_status,
+                                  self._status_changed_handler)
+        if self._prop_current_position is not None:
             self.sub_prop_changed(self._prop_current_position,
                                   self._position_changed_handler)
 
+    def _status_changed_handler(self, prop: MIoTSpecProperty,
+                                value: Any) -> None:
+        """在停止状态和终点位置乱序到达时暂缓发布空闲状态。"""
+        is_moving = value in (
+            self._prop_status_opening + self._prop_status_closing)
+        if is_moving:
+            self._status_was_moving = True
+            self._cancel_pending_stop_state()
+            return
+
+        if self._status_was_moving and not self._is_terminal_position():
+            self._status_was_moving = False
+            self._schedule_pending_stop_state()
+            return
+
+        self._status_was_moving = False
+
     def _position_changed_handler(self, prop: MIoTSpecProperty,
                                   ctx: Any) -> None:
-        self._prop_pos_closing = False
-        self._prop_pos_opening = False
+        """在终点位置到达时立即解除因停止状态造成的延迟。"""
+        if self._status_stop_pending and self._is_terminal_position():
+            self._cancel_pending_stop_state()
+        self._update_terminal_status_motion()
+        if self._prop_status is None:
+            self._prop_pos_closing = False
+            self._prop_pos_opening = False
+
+    def _is_terminal_position(self) -> bool:
+        """判断当前位置是否已经位于完全打开或完全关闭的终点。"""
+        return self.current_cover_position in {0, 100}
+
+    def _schedule_pending_stop_state(self) -> None:
+        """延迟发布停止状态，等待紧随其后的终点位置上报。"""
+        if self._pending_write_ha_state_timer:
+            self._pending_write_ha_state_timer.cancel()
+        self._status_stop_pending = True
+        self._pending_write_ha_state_timer = self._main_loop.call_later(
+            self._STATUS_STOP_GRACE_SECONDS,
+            self._publish_pending_stop_state)
+
+    def _cancel_pending_stop_state(self) -> None:
+        """取消尚未发布的停止状态，使当前属性更新立即生效。"""
+        if not self._status_stop_pending:
+            return
+        if self._pending_write_ha_state_timer:
+            self._pending_write_ha_state_timer.cancel()
+            self._pending_write_ha_state_timer = None
+        self._status_stop_pending = False
+
+    def _publish_pending_stop_state(self) -> None:
+        """在等待窗口结束后发布真实的停止状态。"""
+        self._pending_write_ha_state_timer = None
+        self._status_stop_pending = False
         self.async_write_ha_state()
 
+    def _uses_terminal_status_workaround(self) -> bool:
+        """判断当前型号是否会在到位后持续上报运动状态。"""
+        return self.miot_device.model in self._TERMINAL_STATUS_STUCK_MODELS
+
+    def _start_terminal_status_motion(
+        self, direction: str, target_position: int
+    ) -> None:
+        """记录该型号由命令发起的运动，避免起点状态被误判为空闲。"""
+        if not self._uses_terminal_status_workaround():
+            return
+        self._terminal_status_motion_direction = direction
+        self._terminal_status_motion_start_position = (
+            self.current_cover_position)
+        self._terminal_status_motion_target_position = target_position
+        self._terminal_status_motion_has_left_start = False
+
+    def _clear_terminal_status_motion(self) -> None:
+        """清除已完成或被停止的命令运动记录。"""
+        self._terminal_status_motion_direction = None
+        self._terminal_status_motion_start_position = None
+        self._terminal_status_motion_target_position = None
+        self._terminal_status_motion_has_left_start = False
+
+    def _update_terminal_status_motion(self) -> None:
+        """在位置实际抵达命令目标后结束运动记录。"""
+        if self._terminal_status_motion_direction is None:
+            return
+        current = self.current_cover_position
+        if current is None:
+            return
+        if current != self._terminal_status_motion_start_position:
+            self._terminal_status_motion_has_left_start = True
+        if (
+            self._terminal_status_motion_has_left_start
+            and current == self._terminal_status_motion_target_position
+        ):
+            self._clear_terminal_status_motion()
+
     async def async_open_cover(self, **kwargs) -> None:
-        """Open the cover."""
+        """发送打开命令，并为指定型号记录向完全打开位置的运动。"""
         current = None if (self._prop_current_position
                            is None) else self.get_prop_value(
                                prop=self._prop_current_position)
         if (current is not None) and (current < self._prop_position_value_max):
             self._prop_pos_opening = True
             self._prop_pos_closing = False
+            self._start_terminal_status_motion(direction='opening',
+                                               target_position=100)
         await self.set_property_async(self._prop_motor_control,
                                       self._prop_motor_value_open)
 
     async def async_close_cover(self, **kwargs) -> None:
-        """Close the cover."""
+        """发送关闭命令，并为指定型号记录向完全关闭位置的运动。"""
         current = None if (self._prop_current_position
                            is None) else self.get_prop_value(
                                prop=self._prop_current_position)
         if (current is not None) and (current > self._prop_position_value_min):
             self._prop_pos_opening = False
             self._prop_pos_closing = True
+            self._start_terminal_status_motion(direction='closing',
+                                               target_position=0)
         await self.set_property_async(self._prop_motor_control,
                                       self._prop_motor_value_close)
 
     async def async_stop_cover(self, **kwargs) -> None:
-        """Stop the cover."""
+        """清除命令运动记录并发送窗帘停止命令。"""
         self._prop_pos_opening = False
         self._prop_pos_closing = False
+        self._clear_terminal_status_motion()
         await self.set_property_async(self._prop_motor_control,
                                       self._prop_motor_value_pause)
 
     async def async_set_cover_position(self, **kwargs) -> None:
-        """Set the position of the cover."""
+        """发送目标位置，并为指定型号记录运动方向和目标。"""
         pos = kwargs.get(ATTR_POSITION, None)
         if pos is None:
             return None
@@ -255,6 +363,10 @@ class Cover(MIoTServiceEntity, CoverEntity):
         if current is not None:
             self._prop_pos_opening = pos > current
             self._prop_pos_closing = pos < current
+            if pos != current:
+                self._start_terminal_status_motion(
+                    direction='opening' if pos > current else 'closing',
+                    target_position=pos)
         pos = round(pos * self._prop_position_value_range / 100)
         await self.set_property_async(prop=self._prop_target_position,
                                       value=pos)
@@ -286,7 +398,12 @@ class Cover(MIoTServiceEntity, CoverEntity):
 
     @property
     def is_opening(self) -> Optional[bool]:
-        """Return if the cover is opening."""
+        """返回窗帘是否正在打开。"""
+        if self._uses_terminal_status_workaround():
+            if self._terminal_status_motion_direction is not None:
+                return self._terminal_status_motion_direction == 'opening'
+            if self._is_terminal_position():
+                return False
         if self._prop_status and self._prop_status_opening:
             return (self.get_prop_value(prop=self._prop_status)
                     in self._prop_status_opening)
@@ -296,7 +413,12 @@ class Cover(MIoTServiceEntity, CoverEntity):
 
     @property
     def is_closing(self) -> Optional[bool]:
-        """Return if the cover is closing."""
+        """返回窗帘是否正在关闭。"""
+        if self._uses_terminal_status_workaround():
+            if self._terminal_status_motion_direction is not None:
+                return self._terminal_status_motion_direction == 'closing'
+            if self._is_terminal_position():
+                return False
         if self._prop_status and self._prop_status_closing:
             return (self.get_prop_value(prop=self._prop_status)
                     in self._prop_status_closing)
